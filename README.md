@@ -20,5 +20,5 @@ A modern, beautiful GUI application demonstrating the differences between TCP an
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/rdma-file-transfer-demo.git
+   git clone https://github.com/keshavbadaya14/rdma-file-transfer-demo.git
    cd rdma-file-transfer-demo
