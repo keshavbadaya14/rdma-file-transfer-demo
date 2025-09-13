@@ -22,7 +22,6 @@ A modern, beautiful GUI application demonstrating the differences between TCP an
    ```bash
    git clone https://github.com/keshavbadaya14/rdma-file-transfer-demo.git
    cd rdma-file-transfer-demo
-
-2. Install Tkinter:
-   sudo apt update
-   sudo apt install python3-tk
+   ```
+2. pip install requirements.txt
+3. python src/rdma_demo_app.py
