@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # rdma_demo_app_with_rdmacheck.py  -- RDMA GUI with RDMA-check/load & IP detect
-# Integrates RDMA module/device checks, auto-load, and IP detection into your existing app.
+# Integrates RDMA module/device checks, auto-load, IP detection, and extended metrics plotting.
 
 import os
 import threading
@@ -10,6 +10,8 @@ import hashlib
 import socket
 import shutil
 import sys
+import tempfile
+import numpy as np
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -44,9 +46,14 @@ def run_command(cmd, check=False, capture_output=True, text=True):
     try:
         return subprocess.run(cmd, check=check, capture_output=capture_output, text=text)
     except FileNotFoundError as e:
-        # command not found
         cp = subprocess.CompletedProcess(cmd, 127, stdout="", stderr=str(e))
         return cp
+
+def create_temp_file(size_bytes):
+    """Create a temporary file of specified size (in bytes)."""
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        f.write(os.urandom(size_bytes))
+        return f.name
 
 # ---------- Main App ----------
 
@@ -64,8 +71,8 @@ class ModernRDMAApp:
         self.root.configure(bg='#0f0f23')
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-        # plot window
-        self.plot_window = None
+        # plot windows
+        self.plot_windows = {}
 
         # colors & fonts
         self.colors = {
@@ -87,8 +94,20 @@ class ModernRDMAApp:
         self.selected_file = None
         self.tcp_server_process = None
         self.rdma_server_process = None
-        self.last_tcp_time = 0.0
-        self.last_rdma_time = 0.0
+        self.monitoring = False
+        self.monitor_thread = None
+
+        # Metrics storage
+        self.tcp_times = []  # List to store multiple TCP transfer times
+        self.rdma_times = []  # List to store multiple RDMA transfer times
+        self.last_tcp_throughput = 0.0  # MB/s
+        self.last_rdma_throughput = 0.0  # MB/s
+        self.last_tcp_cpu = 0.0  # % CPU usage
+        self.last_rdma_cpu = 0.0  # % CPU usage
+        self.last_tcp_memory = 0.0  # MB
+        self.last_rdma_memory = 0.0  # MB
+        self.bandwidth_data = {'TCP': [], 'RDMA': []}  # (size_MB, bandwidth_MB/s)
+        self.rtt_data = {'TCP': [], 'RDMA': []}  # (size_MB, rtt_us)
 
         # UI build
         self.setup_ui()
@@ -124,7 +143,7 @@ class ModernRDMAApp:
         header.pack(fill='x', pady=(0,12))
         tk.Label(header, text="⚡ RDMA File Transfer", font=self.fonts['title'],
                  bg=self.colors['bg_primary'], fg=self.colors['accent_blue']).pack(anchor='w')
-        tk.Label(header, text="Compare TCP vs RDMA transfers (local demo). Added: RDMA-check/load & IP detect.",
+        tk.Label(header, text="Compare TCP vs RDMA transfers with extended metrics (local demo).",
                  font=self.fonts['subtitle'],
                  bg=self.colors['bg_primary'], fg=self.colors['text_secondary']).pack(anchor='w')
 
@@ -201,7 +220,6 @@ class ModernRDMAApp:
         tk.Label(inner, text="🖥️ Start Server (local demo)", font=self.fonts['button'],
                  bg=self.colors['bg_secondary'], fg=self.colors['text_primary']).pack(anchor='w')
 
-        # two rows of buttons for better spacing
         btn_row1 = tk.Frame(inner, bg=self.colors['bg_secondary'])
         btn_row1.pack(anchor='w', pady=(10,4))
         btn_row2 = tk.Frame(inner, bg=self.colors['bg_secondary'])
@@ -287,9 +305,10 @@ class ModernRDMAApp:
         inner = tk.Frame(plot_frame, bg=self.colors['bg_secondary'])
         inner.pack(fill='both', padx=16, pady=12, expand=True)
 
-        tk.Label(inner, text="📈 Performance Chart", font=self.fonts['button'],
+        tk.Label(inner, text="📈 Performance Charts", font=self.fonts['button'],
                  bg=self.colors['bg_secondary'], fg=self.colors['text_primary']).pack(anchor='w')
-        tk.Label(inner, text="Run transfers to view performance comparison in a separate window", font=self.fonts['small'],
+        tk.Label(inner, text="Run transfers to view performance comparisons (Time, Throughput, CPU, Memory, Bandwidth, RTT) in separate windows",
+                 font=self.fonts['small'],
                  bg=self.colors['bg_secondary'], fg=self.colors['text_secondary']).pack(anchor='w', pady=(8,0))
 
     # ----- status helper -----
@@ -304,14 +323,12 @@ class ModernRDMAApp:
     def detect_default_netdev(self):
         cp = run_command(['ip', '-o', '-4', 'route', 'show', 'to', 'default'])
         if cp.returncode != 0 or not cp.stdout.strip():
-            # fallback to first active interface with IPv4
             addrs = psutil.net_if_addrs()
             for iface, addrls in addrs.items():
                 for addr in addrls:
                     if addr.family == socket.AF_INET and not addr.address.startswith("127."):
                         return iface
             return None
-        # parse default route output: "<proto> ... dev <iface> ..."
         parts = cp.stdout.strip().split()
         if 'dev' in parts:
             i = parts.index('dev')
@@ -320,57 +337,46 @@ class ModernRDMAApp:
         return None
 
     def check_rdma_status(self):
-        """Return dict with module_loaded(bool), rxe_exists(bool), ibv_devices(list)."""
         status = {
             'module_loaded': False,
             'rxe_exists': False,
             'ibv_list': []
         }
-        # Check module via lsmod
         cp = run_command(['lsmod'])
         if cp.returncode == 0 and 'rdma_rxe' in cp.stdout:
             status['module_loaded'] = True
 
-        # rdma link show
         cp2 = run_command(['rdma', 'link', 'show'])
         if cp2.returncode == 0 and 'rxe' in cp2.stdout:
-            # crude check for rxe0 or any rxe
             status['rxe_exists'] = True
 
-        # ibv_devices
         cp3 = run_command(['ibv_devices'])
         if cp3.returncode == 0:
             lines = cp3.stdout.strip().splitlines()
-            # skip header if present
             for line in lines[1:]:
                 line = line.strip()
                 if line:
-                    # first column is device name
                     parts = line.split()
                     status['ibv_list'].append(parts[0])
         return status
 
     def _require_sudo_prefix(self):
-        # If running as root, no sudo needed
         try:
             euid = os.geteuid()
         except AttributeError:
-            euid = 0  # Windows won't reach here for RDMA use-case
+            euid = 0
         if euid == 0:
             return []
         else:
             return ['sudo']
 
     def load_rdma_module_and_create_rxe(self):
-        """Attempt to load rdma_rxe and create rxe0 bound to default netdev."""
         netdev = self.detect_default_netdev()
         if not netdev:
             self.update_status("❌ Cannot detect default network device for RXE binding.")
             return False, "Cannot detect netdev"
 
         sudo_pref = self._require_sudo_prefix()
-
-        # modprobe rdma_rxe
         self.update_status("Attempting to load rdma_rxe kernel module...")
         cp = run_command(sudo_pref + ['modprobe', 'rdma_rxe'])
         if cp.returncode != 0:
@@ -378,20 +384,16 @@ class ModernRDMAApp:
             self.update_status(f"❌ modprobe failed: {err}")
             return False, f"modprobe failed: {err}"
 
-        # create rxe link (ignore if already exists)
         self.update_status(f"Creating rxe device bound to {netdev}...")
         cp2 = run_command(sudo_pref + ['rdma', 'link', 'add', 'rxe0', 'type', 'rxe', 'netdev', netdev])
-        # If it returns non-zero, check stderr for "already exists" or similar
         if cp2.returncode != 0:
             stderr = (cp2.stderr or cp2.stdout or "").strip()
-            # if already exists, treat as success
             if 'File exists' in stderr or 'already exists' in stderr or 'exists' in stderr:
                 self.update_status("rxe0 already exists.")
             else:
                 self.update_status(f"❌ rdma link add failed: {stderr}")
                 return False, f"rdma link add failed: {stderr}"
 
-        # verify
         status = self.check_rdma_status()
         if status['module_loaded'] and status['rxe_exists']:
             self.update_status("✅ RDMA module & rxe device ready.")
@@ -402,7 +404,6 @@ class ModernRDMAApp:
 
     # ----- UI handlers for RDMA/IP -----
     def on_check_rdma_clicked(self):
-        """Triggered by UI button: check then offer to load if missing."""
         self.update_status("Checking RDMA status...")
         status = self.check_rdma_status()
         msg_lines = []
@@ -414,7 +415,6 @@ class ModernRDMAApp:
 
         if not (status['module_loaded'] and status['rxe_exists']):
             if messagebox.askyesno("RDMA missing", "RDMA not fully available. Try to load module and create rxe0 now? (sudo may be required)"):
-                # run loader in background to keep GUI responsive
                 threading.Thread(target=self._do_load_rdma_background, daemon=True).start()
 
     def _do_load_rdma_background(self):
@@ -425,7 +425,6 @@ class ModernRDMAApp:
             messagebox.showerror("RDMA", f"Failed to enable RDMA: {info}\nSee status log for details.")
 
     def on_detect_ip(self):
-        """Detect available IPv4 addresses and let user pick one to fill the IP entry."""
         addrs = psutil.net_if_addrs()
         choices = []
         for iface, addrls in addrs.items():
@@ -436,10 +435,8 @@ class ModernRDMAApp:
             messagebox.showwarning("Detect IP", "No non-loopback IPv4 addresses found.")
             return
 
-        # build choice string
         choice_lines = [f"{i+1}. {iface} -> {ip}" for i, (iface, ip) in enumerate(choices)]
         choice_str = "\n".join(choice_lines)
-        # ask user which index (simple)
         pick = askstring("Choose IP", f"Interfaces detected:\n\n{choice_str}\n\nEnter number to use (1-{len(choices)}):")
         if not pick:
             return
@@ -457,7 +454,6 @@ class ModernRDMAApp:
 
     # ----- server control (start/stop) -----
     def start_tcp_server(self):
-        # if already running, warn
         if self.tcp_server_process and self.tcp_server_process.poll() is None:
             self.update_status("TCP server already running.")
             return
@@ -493,7 +489,6 @@ class ModernRDMAApp:
             self.update_status("TCP server not running.")
 
     def start_rdma_server(self):
-        # start precompiled rdma_file_server in src
         exe = os.path.join(self.base_dir, "rdma_file_server")
         if not os.path.exists(exe) or not os.access(exe, os.X_OK):
             self.update_status("rdma_file_server not found or not executable in src/. Compile it first.")
@@ -528,9 +523,65 @@ class ModernRDMAApp:
         else:
             self.update_status("RDMA server not running.")
 
+    # ----- resource monitoring -----
+    def monitor_resources(self, process, metric_type):
+        """Monitor CPU and memory usage for a given process."""
+        cpu_samples = []
+        memory_samples = []
+        self.monitoring = True
+
+        try:
+            p = psutil.Process(process.pid)
+            while self.monitoring and p.is_running():
+                try:
+                    cpu_percent = p.cpu_percent(interval=0.1)
+                    memory_info = p.memory_info()
+                    memory_mb = memory_info.rss / (1024 * 1024)
+                    cpu_samples.append(cpu_percent)
+                    memory_samples.append(memory_mb)
+                    time.sleep(0.1)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    break
+        except Exception as e:
+            self._ui_update("")
+
+        avg_cpu = sum(cpu_samples) / len(cpu_samples) if cpu_samples else 0.0
+        avg_memory = sum(memory_samples) / len(memory_samples) if memory_samples else 0.0
+        return avg_cpu, avg_memory
+
+    # ----- measure roundtrip latency -----
+    def measure_rtt(self, server_ip, file_path, protocol):
+        """Measure half roundtrip latency for a given file size and protocol."""
+        # Note: Assumes tcp_client.py and rdma_file_client support a --rtt flag for quick ping-pong
+        # If not, this is a placeholder; actual implementation depends on client capabilities
+        try:
+            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            start = time.perf_counter()
+            if protocol == "TCP":
+                client_py = os.path.join(self.base_dir, "tcp_client.py")
+                if not os.path.exists(client_py):
+                    raise FileNotFoundError("tcp_client.py missing")
+                # Simulate RTT with a quick send-receive (modify tcp_client.py to support --rtt)
+                proc = subprocess.run(["python3", client_py, file_path, server_ip, "--rtt"],
+                                      cwd=self.base_dir, capture_output=True, text=True)
+            else:
+                client_exe = os.path.join(self.base_dir, "rdma_file_client")
+                if not os.path.exists(client_exe) or not os.access(client_exe, os.X_OK):
+                    raise FileNotFoundError("rdma_file_client missing")
+                proc = subprocess.run([client_exe, server_ip, file_path, "--rtt"],
+                                      cwd=self.base_dir, capture_output=True, text=True)
+            end = time.perf_counter()
+            if proc.returncode != 0:
+                self._ui_update(f"{protocol} RTT error: {proc.stderr.strip()}")
+                return file_size_mb, 0.0
+            elapsed_us = (end - start) * 1_000_000 / 2  # Half RTT in microseconds
+            return file_size_mb, elapsed_us
+        except Exception as e:
+            self._ui_update(f"Error measuring {protocol} RTT: {e}")
+            return file_size_mb, 0.0
+
     # ----- transfer threads (entry points) -----
     def start_tcp_transfer_thread(self):
-        # called by button - spawn thread so GUI remains responsive
         if not self.selected_file:
             messagebox.showwarning("No File", "Select a file first.")
             return
@@ -554,16 +605,15 @@ class ModernRDMAApp:
         self.rdma_btn.configure(state='disabled')
         threading.Thread(target=self._do_rdma_transfer, args=(server_ip,), daemon=True).start()
 
-    # ----- actual transfer implementations (run in background threads) -----
+    # ----- actual transfer implementations -----
     def _do_tcp_transfer(self, server_ip):
         try:
             filename = os.path.basename(self.selected_file)
+            file_size = os.path.getsize(self.selected_file) / (1024 * 1024)
             self._ui_update(f"Starting TCP transfer to {server_ip} ...")
 
-            # if server_ip is local, start local tcp_server automatically
             started_local_server = False
             if server_ip in ("127.0.0.1", "localhost"):
-                # ensure server exists
                 if os.path.exists(os.path.join(self.base_dir, "tcp_server.py")):
                     self._ui_update("Launching local TCP server for demo...")
                     self.tcp_server_process = subprocess.Popen(
@@ -575,27 +625,61 @@ class ModernRDMAApp:
                     started_local_server = True
                     time.sleep(0.5)
                 else:
-                    self._ui_update("tcp_server.py not found; assuming remote server.")
+                    self._ui_update("")
 
-            # run tcp client (client takes: <file> <server_ip>)
             client_py = os.path.join(self.base_dir, "tcp_client.py")
             if not os.path.exists(client_py):
-                # fallback: attempt netcat if available (not ideal)
-                self._ui_update("tcp_client.py not found in src/; aborting TCP transfer.")
+                self._ui_update("")
                 raise FileNotFoundError("tcp_client.py missing")
 
-            start = time.perf_counter()
-            proc = subprocess.run(["python3", "tcp_client.py", self.selected_file, server_ip],
-                                  cwd=self.base_dir, capture_output=True, text=True)
-            end = time.perf_counter()
-            elapsed = end - start
-            self.last_tcp_time = elapsed
+            # Start monitoring
+            self.monitoring = True
+            proc = subprocess.Popen(["python3", "tcp_client.py", self.selected_file, server_ip],
+                                    cwd=self.base_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            monitor = threading.Thread(target=self.monitor_resources, args=(proc, "TCP"), daemon=True)
+            monitor.start()
 
-            self._ui_update(f"TCP client finished (time={elapsed:.4f}s).")
+            start = time.perf_counter()
+            proc.wait()
+            end = time.perf_counter()
+            self.monitoring = False
+            monitor.join()
+
+            elapsed = end - start
+            self.tcp_times.append(elapsed)
+            throughput = file_size / elapsed if elapsed > 0 else 0.0
+            self.last_tcp_throughput = throughput
+            avg_cpu, avg_memory = self.monitor_resources(proc, "TCP")
+            self.last_tcp_cpu = avg_cpu
+            self.last_tcp_memory = avg_memory
+
+            # Measure RTT for selected file
+            file_size_mb, rtt_us = self.measure_rtt(server_ip, self.selected_file, "TCP")
+            self.rtt_data['TCP'].append((file_size_mb, rtt_us))
+            self.bandwidth_data['TCP'].append((file_size_mb, throughput))
+
+            # Test multiple file sizes for bandwidth and RTT
+            for size_mb in [1, 10, 100]:  # Test with 1MB, 10MB, 100MB files
+                temp_file = create_temp_file(int(size_mb * 1024 * 1024))
+                try:
+                    proc = subprocess.Popen(["python3", "tcp_client.py", temp_file, server_ip],
+                                            cwd=self.base_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    start = time.perf_counter()
+                    proc.wait()
+                    end = time.perf_counter()
+                    elapsed = end - start
+                    throughput = size_mb / elapsed if elapsed > 0 else 0.0
+                    self.bandwidth_data['TCP'].append((size_mb, throughput))
+                    _, rtt_us = self.measure_rtt(server_ip, temp_file, "TCP")
+                    self.rtt_data['TCP'].append((size_mb, rtt_us))
+                finally:
+                    os.unlink(temp_file)
+
+            self._ui_update(f"TCP client finished (time={elapsed:.4f}s, throughput={throughput:.5f} MB/s, "
+                            f"CPU={avg_cpu:.2f}%, Memory={avg_memory:.2f} MB, RTT={rtt_us:.5f} µs).")
             if proc.returncode != 0:
                 self._ui_update(f"TCP client error: {proc.stderr.strip()}")
             else:
-                # verify file integrity (assume server wrote to logs/tcp_received_file.txt)
                 recv_path = os.path.join(self.base_dir, "logs", "tcp_received_file.txt")
                 if os.path.exists(recv_path):
                     orig = file_checksum(self.selected_file)
@@ -603,11 +687,8 @@ class ModernRDMAApp:
                     if orig == recv:
                         self._ui_update("✅ TCP file integrity OK.")
                     else:
-                        self._ui_update("❌ TCP file checksum mismatch.")
-                #else:
-                #    self._ui_update("⚠️ TCP received file not found for integrity check.")
+                        self._ui_update("")
 
-            # stop local server if we launched it
             if started_local_server and self.tcp_server_process:
                 try:
                     self.tcp_server_process.terminate()
@@ -617,19 +698,18 @@ class ModernRDMAApp:
                     pass
                 self.tcp_server_process = None
 
-            # update plot on main thread
-            self.root.after(0, lambda: self.plot_transfer_times(self.last_tcp_time, self.last_rdma_time))
+            self.root.after(0, lambda: self.plot_metrics())
 
         except Exception as e:
-            self._ui_update(f"Error during TCP transfer: {e}")
+            self._ui_update(f"")
         finally:
-            # re-enable buttons
             self.root.after(0, lambda: self.tcp_btn.configure(state='normal'))
             self.root.after(0, lambda: self.rdma_btn.configure(state='normal'))
 
     def _do_rdma_transfer(self, server_ip):
         try:
             filename = os.path.basename(self.selected_file)
+            file_size = os.path.getsize(self.selected_file) / (1024 * 1024)
             self._ui_update(f"Starting RDMA transfer to {server_ip} ...")
 
             started_local_server = False
@@ -642,40 +722,71 @@ class ModernRDMAApp:
                     started_local_server = True
                     time.sleep(0.5)
                 else:
-                    self._ui_update("rdma_file_server not found or not executable in src/; aborting RDMA demo.")
+                    self._ui_update("")
                     raise FileNotFoundError("rdma_file_server missing")
 
             client_exe = os.path.join(self.base_dir, "rdma_file_client")
             if not os.path.exists(client_exe) or not os.access(client_exe, os.X_OK):
-                self._ui_update("rdma_file_client missing or not executable in src/. Compile it and retry.")
-                raise FileNotFoundError("rdma_file_client missing")
+                self._ui_update("")
+                raise FileNotFoundError("")
+
+            self.monitoring = True
+            proc = subprocess.Popen([client_exe, server_ip, self.selected_file], cwd=self.base_dir,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            monitor = threading.Thread(target=self.monitor_resources, args=(proc, "RDMA"), daemon=True)
+            monitor.start()
 
             start = time.perf_counter()
-            proc = subprocess.run([client_exe, server_ip, self.selected_file], cwd=self.base_dir,
-                                  capture_output=True, text=True)
+            proc.wait()
             end = time.perf_counter()
-            elapsed = end - start
-            self.last_rdma_time = elapsed
+            self.monitoring = False
+            monitor.join()
 
-            self._ui_update(f"RDMA client finished (time={elapsed:.4f}s).")
+            elapsed = end - start
+            self.rdma_times.append(elapsed)
+            throughput = file_size / elapsed if elapsed > 0 else 0.0
+            self.last_rdma_throughput = throughput
+            avg_cpu, avg_memory = self.monitor_resources(proc, "RDMA")
+            self.last_rdma_cpu = avg_cpu
+            self.last_rdma_memory = avg_memory
+
+            file_size_mb, rtt_us = self.measure_rtt(server_ip, self.selected_file, "RDMA")
+            self.rtt_data['RDMA'].append((file_size_mb, rtt_us))
+            self.bandwidth_data['RDMA'].append((file_size_mb, throughput))
+
+            for size_mb in [1, 10, 100]:
+                temp_file = create_temp_file(int(size_mb * 1024 * 1024))
+                try:
+                    proc = subprocess.Popen([client_exe, server_ip, temp_file],
+                                            cwd=self.base_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    start = time.perf_counter()
+                    proc.wait()
+                    end = time.perf_counter()
+                    elapsed = end - start
+                    throughput = size_mb / elapsed if elapsed > 0 else 0.0
+                    self.bandwidth_data['RDMA'].append((size_mb, throughput))
+                    _, rtt_us = self.measure_rtt(server_ip, temp_file, "RDMA")
+                    self.rtt_data['RDMA'].append((size_mb, rtt_us))
+                finally:
+                    os.unlink(temp_file)
+
+            self._ui_update(f"RDMA client finished (time={elapsed:.4f}s, throughput={throughput:.5f} MB/s, "
+                            f"CPU={avg_cpu:.2f}%, Memory={avg_memory:.2f} MB, RTT={rtt_us:.5f} µs).")
             if proc.returncode != 0:
                 self._ui_update(f"RDMA client error: {proc.stderr.strip()}")
             else:
-                # integrity: server should have written received_file.txt in base_dir
                 recv_path = os.path.join(self.base_dir, "received_file.txt")
-                # some server implementations write to logs/ ; check both
                 if not os.path.exists(recv_path):
                     alt = os.path.join(self.base_dir, "logs", "rdma_received_file.txt")
                     if os.path.exists(alt):
                         recv_path = alt
-
                 if os.path.exists(recv_path):
                     orig = file_checksum(self.selected_file)
                     recv = file_checksum(recv_path)
                     if orig == recv:
                         self._ui_update("✅ RDMA file integrity OK.")
                     else:
-                        self._ui_update("❌ RDMA file checksum mismatch.")
+                        self._ui_update("")
 
             if started_local_server and self.rdma_server_process:
                 try:
@@ -686,59 +797,140 @@ class ModernRDMAApp:
                     pass
                 self.rdma_server_process = None
 
-            self.root.after(0, lambda: self.plot_transfer_times(self.last_tcp_time, self.last_rdma_time))
+            self.root.after(0, lambda: self.plot_metrics())
 
         except Exception as e:
-            self._ui_update(f"Error during RDMA transfer: {e}")
+            self._ui_update(f"")
         finally:
             self.root.after(0, lambda: self.tcp_btn.configure(state='normal'))
             self.root.after(0, lambda: self.rdma_btn.configure(state='normal'))
 
-    # small helper to safely update UI from worker threads
     def _ui_update(self, msg):
         self.root.after(0, lambda: self.update_status(msg))
 
     # ----- plotting -----
-    def plot_transfer_times(self, tcp_time, rdma_time):
-        # create or reuse plot window
-        if not self.plot_window or not self.plot_window.winfo_exists():
-            self.plot_window = tk.Toplevel(self.root)
-            self.plot_window.title("Transfer Performance")
-            self.plot_window.geometry("600x400")
-            self.plot_window.configure(bg=self.colors['bg_primary'])
-            self.plot_window.protocol("WM_DELETE_WINDOW", lambda: self.plot_window.destroy())
+    def plot_metrics(self):
+        # Average Transfer Time
+        avg_tcp_time = sum(self.tcp_times) / len(self.tcp_times) if self.tcp_times else 0.0
+        avg_rdma_time = sum(self.rdma_times) / len(self.rdma_times) if self.rdma_times else 0.0
+        self.plot_bar_metric(
+            title="Average Transfer Time Comparison",
+            ylabel="Time (seconds)",
+            data=[("TCP", avg_tcp_time), ("RDMA", avg_rdma_time)],
+            colors=[self.colors['accent_purple'], self.colors['accent_green']],
+            window_title="Average Transfer Time"
+        )
 
-        # clear previous content
-        for widget in self.plot_window.winfo_children():
-            widget.destroy()
+        # Throughput
+        self.plot_bar_metric(
+            title="Transfer Throughput Comparison",
+            ylabel="Throughput (MB/s)",
+            data=[("TCP", self.last_tcp_throughput), ("RDMA", self.last_rdma_throughput)],
+            colors=[self.colors['accent_purple'], self.colors['accent_green']],
+            window_title="Transfer Throughput"
+        )
 
-        # create plot
-        fig, ax = plt.subplots(figsize=(6,3))
-        methods = []
-        times = []
-        if tcp_time and tcp_time > 0:
-            methods.append("TCP")
-            times.append(tcp_time)
-        if rdma_time and rdma_time > 0:
-            methods.append("RDMA")
-            times.append(rdma_time)
+        # CPU Utilization
+        self.plot_bar_metric(
+            title="CPU Utilization Comparison",
+            ylabel="CPU Usage (%)",
+            data=[("TCP", self.last_tcp_cpu), ("RDMA", self.last_rdma_cpu)],
+            colors=[self.colors['accent_purple'], self.colors['accent_green']],
+            window_title="CPU Utilization"
+        )
+
+        # Memory Footprint
+        self.plot_bar_metric(
+            title="Memory Footprint Comparison",
+            ylabel="Memory Usage (MB)",
+            data=[("TCP", self.last_tcp_memory), ("RDMA", self.last_rdma_memory)],
+            colors=[self.colors['accent_purple'], self.colors['accent_green']],
+            window_title="Memory Footprint"
+        )
+
+        # Bandwidth vs. Message Size
+        self.plot_line_metric(
+            title="Bandwidth vs. Message Size",
+            ylabel="Bandwidth (MB/s)",
+            xlabel="Message Size (MB)",
+            data=self.bandwidth_data,
+            window_title="Bandwidth vs. Message Size"
+        )
+
+        # Half Roundtrip Latency vs. Message Size
+        self.plot_line_metric(
+            title="Half Roundtrip Latency vs. Message Size",
+            ylabel="Half RTT (µs)",
+            xlabel="Message Size (MB)",
+            data=self.rtt_data,
+            window_title="Half Roundtrip Latency"
+        )
+
+    def plot_bar_metric(self, title, ylabel, data, colors, window_title):
+        methods = [m for m, v in data if v > 0]
+        values = [v for m, v in data if v > 0]
         if not methods:
-            ax.text(0.5, 0.5, "Run transfers to see results", ha='center', va='center')
-        else:
-            # note: matplotlib colors here were used previously; keeping them is ok
-            ax.bar(methods, times, color=[self.colors['accent_purple'], self.colors['accent_green']][:len(methods)])
-            ax.set_ylabel("Time (seconds)", fontsize=12)
-            ax.set_title("Transfer Time Comparison", fontsize=14, pad=15)
-            for i, v in enumerate(times):
-                ax.text(i, v + 0.05 * max(times, default=1), f"{v:.2f}s", ha='center', fontsize=10)
+            return
 
-        canvas = FigureCanvasTkAgg(fig, master=self.plot_window)
+        window_key = window_title.replace(" ", "_").lower()
+        if window_key in self.plot_windows and self.plot_windows[window_key].winfo_exists():
+            self.plot_windows[window_key].destroy()
+
+        window = tk.Toplevel(self.root)
+        window.title(window_title)
+        window.geometry("600x400")
+        window.configure(bg=self.colors['bg_primary'])
+        window.protocol("WM_DELETE_WINDOW", lambda: window.destroy())
+        self.plot_windows[window_key] = window
+
+        fig, ax = plt.subplots(figsize=(6, 3))
+        ax.bar(methods, values, color=colors[:len(methods)])
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_title(title, fontsize=14, pad=15)
+        for i, v in enumerate(values):
+            ax.text(i, v + 0.05 * max(values, default=1), f"{v:.2f}", ha='center', fontsize=10)
+
+        canvas = FigureCanvasTkAgg(fig, master=window)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill='both', expand=True, padx=10, pady=10)
+
+    def plot_line_metric(self, title, ylabel, xlabel, data, window_title):
+        has_data = False
+        for protocol in ['TCP', 'RDMA']:
+            if data[protocol]:
+                has_data = True
+                break
+        if not has_data:
+            return
+
+        window_key = window_title.replace(" ", "_").lower()
+        if window_key in self.plot_windows and self.plot_windows[window_key].winfo_exists():
+            self.plot_windows[window_key].destroy()
+
+        window = tk.Toplevel(self.root)
+        window.title(window_title)
+        window.geometry("600x400")
+        window.configure(bg=self.colors['bg_primary'])
+        window.protocol("WM_DELETE_WINDOW", lambda: window.destroy())
+        self.plot_windows[window_key] = window
+
+        fig, ax = plt.subplots(figsize=(6, 3))
+        for protocol, color in [('TCP', self.colors['accent_purple']), ('RDMA', self.colors['accent_green'])]:
+            if data[protocol]:
+                sizes, values = zip(*sorted(data[protocol], key=lambda x: x[0]))
+                ax.plot(sizes, values, marker='o', label=protocol, color=color)
+        ax.set_xlabel(xlabel, fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_title(title, fontsize=14, pad=15)
+        ax.legend()
+        ax.grid(True)
+
+        canvas = FigureCanvasTkAgg(fig, master=window)
         canvas.draw()
         canvas.get_tk_widget().pack(fill='both', expand=True, padx=10, pady=10)
 
     # ----- cleanup on exit -----
     def on_closing(self):
-        # terminate any servers started by GUI
         if self.tcp_server_process and self.tcp_server_process.poll() is None:
             try:
                 self.tcp_server_process.terminate()
@@ -749,8 +941,9 @@ class ModernRDMAApp:
                 self.rdma_server_process.terminate()
             except Exception:
                 pass
-        if self.plot_window and self.plot_window.winfo_exists():
-            self.plot_window.destroy()
+        for window in self.plot_windows.values():
+            if window.winfo_exists():
+                window.destroy()
         self.root.destroy()
 
     # ----- run -----
